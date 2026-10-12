@@ -92,10 +92,12 @@ class EDITHVoiceUI:
         if self.worker is not None and self.worker.is_alive():
             return
 
+        # Keep this thread non-daemon so Python cannot tear down its executors
+        # while STT/TTS is still working. main() now joins it during shutdown.
         self.worker = threading.Thread(
             target=self._run_async_worker,
             name="edith-voice-worker",
-            daemon=True,
+            daemon=False,
         )
         self.worker.start()
         self.root.after(100, self._watch_worker)
@@ -104,14 +106,26 @@ class EDITHVoiceUI:
         try:
             asyncio.run(self.run_voice_loop())
         except Exception as exc:
-            logger.error(
-                f"Voice worker terminated unexpectedly: {exc}",
-                exc_info=True,
-            )
+            if self.stop_event.is_set():
+                logger.debug(
+                    f"Voice worker ended during shutdown: {exc}",
+                    exc_info=True,
+                )
+            else:
+                logger.error(
+                    f"Voice worker terminated unexpectedly: {exc}",
+                    exc_info=True,
+                )
 
     def _watch_worker(self) -> None:
+        if self._shutdown_started:
+            return
+
         if self.worker is not None and self.worker.is_alive():
-            self.root.after(100, self._watch_worker)
+            try:
+                self.root.after(100, self._watch_worker)
+            except tk.TclError:
+                pass
             return
 
         self._worker_finished()
@@ -158,13 +172,13 @@ class EDITHVoiceUI:
             except tk.TclError:
                 return
 
-        self.root.after(50, self._process_status)
+        try:
+            self.root.after(50, self._process_status)
+        except tk.TclError:
+            pass
 
     async def run_voice_loop(self) -> None:
-        orchestrator = EdithOrchestrator(
-            session_id="voice_session"
-        )
-
+        orchestrator = EdithOrchestrator(session_id="voice_session")
         stt = STTEngine()
         tts = TTSEngine()
 
@@ -191,6 +205,8 @@ class EDITHVoiceUI:
                     phrase_time_limit=15,
                 )
 
+                # A stop request can arrive while STT is waiting for speech.
+                # Do not process that result or start another listening cycle.
                 if self.stop_event.is_set():
                     break
 
@@ -208,6 +224,7 @@ class EDITHVoiceUI:
 
                 if speech_lower in STOP_KEYWORDS:
                     shutdown_msg = "Standing by. Goodbye, Boss."
+                    self.request_stop()
                     self.set_status("SPEAKING")
                     print(f"🔊 EDITH: {shutdown_msg}")
                     await tts.speak_async(shutdown_msg)
@@ -218,14 +235,13 @@ class EDITHVoiceUI:
                     "Sending voice request to EDITH orchestrator..."
                 )
 
-                response = await orchestrator.process_turn(
-                    cleaned_speech
-                )
+                response = await orchestrator.process_turn(cleaned_speech)
+
+                if self.stop_event.is_set():
+                    break
 
                 if not response:
-                    logger.warning(
-                        "EDITH returned an empty response."
-                    )
+                    logger.warning("EDITH returned an empty response.")
                     self.set_status("LISTENING")
                     continue
 
@@ -238,7 +254,8 @@ class EDITHVoiceUI:
                 print(f"🔊 EDITH: {response}")
                 await tts.speak_async(response)
 
-                await asyncio.sleep(0.35)
+                if not self.stop_event.is_set():
+                    await asyncio.sleep(0.35)
 
         except asyncio.CancelledError:
             logger.info("Voice loop task cancelled.")
@@ -246,26 +263,37 @@ class EDITHVoiceUI:
 
         except KeyboardInterrupt:
             logger.info("Voice session interrupted.")
-            try:
-                self.set_status("SPEAKING")
-                await tts.speak_async("Voice session interrupted.")
-            except Exception:
-                pass
+            if not self.stop_event.is_set():
+                try:
+                    self.set_status("SPEAKING")
+                    await tts.speak_async("Voice session interrupted.")
+                except Exception:
+                    logger.debug(
+                        "Could not speak interruption message.",
+                        exc_info=True,
+                    )
 
         except Exception as exc:
             logger.error(
                 f"Error in voice loop: {exc}",
                 exc_info=True,
             )
-            try:
-                self.set_status("SPEAKING")
-                await tts.speak_async(
-                    "I encountered an error processing that request."
-                )
-            except Exception:
-                pass
+
+            # Do not start another TTS request after a shutdown has begun.
+            if not self.stop_event.is_set():
+                try:
+                    self.set_status("SPEAKING")
+                    await tts.speak_async(
+                        "I encountered an error processing that request."
+                    )
+                except Exception:
+                    logger.debug(
+                        "Could not speak the voice-loop error message.",
+                        exc_info=True,
+                    )
 
         finally:
+            # The event loop stays alive until all engine cleanup finishes.
             for engine in (stt, tts):
                 close_method = getattr(engine, "close", None)
                 if close_method is None:
@@ -291,7 +319,6 @@ def resolve_gif_path() -> Path:
         if candidate.is_file():
             return candidate
 
-    # Your actual project filename is the first and preferred path.
     candidates = [
         PROJECT_ROOT / "ui" / "edith_animation.gif",
         PROJECT_ROOT / "ui" / "edith_orb.gif",
@@ -314,6 +341,7 @@ def resolve_gif_path() -> Path:
 
 def main() -> None:
     root: tk.Tk | None = None
+    app: EDITHVoiceUI | None = None
 
     try:
         gif_path = resolve_gif_path()
@@ -325,7 +353,9 @@ def main() -> None:
         root.mainloop()
 
     except KeyboardInterrupt:
-        logger.info("Voice interface shut down cleanly.")
+        logger.info("Keyboard interrupt received; requesting graceful shutdown.")
+        if app is not None:
+            app.request_stop()
 
     except FileNotFoundError as exc:
         print(f"EDITH UI error: {exc}")
@@ -339,6 +369,24 @@ def main() -> None:
         sys.exit(1)
 
     finally:
+        # Never destroy the UI / finish the main thread while the voice worker
+        # is still using STT, TTS, or its asyncio event loop.
+        if app is not None:
+            app.request_stop()
+            if app.worker is not None and app.worker.is_alive():
+                logger.info("Waiting for EDITH voice worker to finish...")
+                try:
+                    app.worker.join()
+                except KeyboardInterrupt:
+                    # A second Ctrl+C should not trigger interpreter shutdown
+                    # while the non-daemon worker still owns live resources.
+                    logger.warning(
+                        "Shutdown is waiting for the active voice operation to finish."
+                    )
+                    app.worker.join()
+
+            app._worker_finished()
+
         if root is not None:
             try:
                 root.destroy()
