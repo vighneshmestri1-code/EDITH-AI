@@ -267,22 +267,57 @@ class TaskScheduler:
                 f"Failed to schedule task: {str(e)}"
             )
 
+   
     def stop(self) -> None:
         """
-        Stop the scheduler cleanly.
+        Stop the scheduler cleanly, even if its event loop
+        has already closed.
         """
 
-        if self.scheduler is None:
+        scheduler = self.scheduler
+
+        if scheduler is None:
             return
 
         try:
-            if self.scheduler.running:
-                self.scheduler.shutdown(
-                    wait=False
+            event_loop = getattr(
+                scheduler,
+                "_eventloop",
+                None,
+            )
+
+            # The asyncio loop may already be closed during
+            # EDITH shutdown. In that case, shutdown cannot
+            # safely be scheduled on that loop.
+            if (
+                event_loop is not None
+                and event_loop.is_closed()
+            ):
+                logger.warning(
+                    "Automation TaskScheduler event loop "
+                    "is already closed; skipping shutdown."
                 )
+                return
+
+            if scheduler.running:
+                scheduler.shutdown(wait=False)
 
                 logger.info(
                     "Automation TaskScheduler stopped."
+                )
+
+        except RuntimeError as e:
+            # Handle a possible race where the event loop
+            # closes after the check above.
+            if "event loop is closed" in str(e).lower():
+                logger.warning(
+                    "Automation TaskScheduler event loop "
+                    "closed during shutdown; skipping cleanup."
+                )
+            else:
+                logger.error(
+                    f"Error stopping Automation TaskScheduler: {e}",
+                    exc_info=True,
                 )
 
         except Exception as e:
